@@ -5,6 +5,7 @@
 
 import copy
 import logging
+import math
 import numpy as np
 import random
 import torch
@@ -15,13 +16,16 @@ from neural_sp.models.base import ModelBase
 from neural_sp.models.lm.rnnlm import RNNLM
 from neural_sp.models.seq2seq.decoders.build import build_decoder
 from neural_sp.models.seq2seq.decoders.fwd_bwd_attention import fwd_bwd_attention
-from neural_sp.models.seq2seq.decoders.rnn_transducer import RNNTransducer
+from neural_sp.models.seq2seq.decoders.las import RNNDecoder
+from neural_sp.models.seq2seq.decoders.rnn_transducer import RNNTransducer as RNNT
+from neural_sp.models.seq2seq.decoders.transformer import TransformerDecoder
 from neural_sp.models.seq2seq.encoders.build import build_encoder
 from neural_sp.models.seq2seq.frontends.frame_stacking import stack_frame
 from neural_sp.models.seq2seq.frontends.input_noise import add_input_noise
 from neural_sp.models.seq2seq.frontends.sequence_summary import SequenceSummaryNetwork
 from neural_sp.models.seq2seq.frontends.spec_augment import SpecAugment
 from neural_sp.models.seq2seq.frontends.splicing import splice
+from neural_sp.models.seq2seq.frontends.streaming import Streaming
 from neural_sp.models.torch_utils import (
     np2tensor,
     tensor2np,
@@ -146,7 +150,7 @@ class Speech2Text(ModelBase):
             # Load the LM for LM fusion and decoder initialization
             if args.external_lm and dir == 'fwd':
                 external_lm = RNNLM(args.lm_conf)
-                load_checkpoint(external_lm, args.external_lm)
+                load_checkpoint(args.external_lm, external_lm)
                 # freeze LM parameters
                 for n, p in external_lm.named_parameters():
                     p.requires_grad = False
@@ -197,19 +201,19 @@ class Speech2Text(ModelBase):
         # main task
         for dir in ['fwd', 'bwd']:
             if hasattr(self, 'dec_' + dir):
-                logging.info('Activate scheduled sampling (main)')
+                logger.info('Activate scheduled sampling (main)')
                 getattr(self, 'dec_' + dir).trigger_scheduled_sampling()
 
         # sub task
         for sub in ['sub1', 'sub2']:
             if hasattr(self, 'dec_fwd_' + sub):
-                logging.info('Activate scheduled sampling (%s)' % sub)
+                logger.info('Activate scheduled sampling (%s)' % sub)
                 getattr(self, 'dec_fwd_' + sub).trigger_scheduled_sampling()
 
     def trigger_quantity_loss(self):
         # main task only now
         if hasattr(self, 'dec_fwd'):
-            logging.info('Activate quantity loss')
+            logger.info('Activate quantity loss')
             getattr(self, 'dec_fwd').trigger_quantity_loss()
 
     def reset_session(self):
@@ -228,13 +232,13 @@ class Speech2Text(ModelBase):
 
         Args:
             batch (dict):
-                xs (list): input data of size `[T, input_dim]`
-                xlens (list): lengths of each element in xs
-                ys (list): reference labels in the main task of size `[L]`
-                ys_sub1 (list): reference labels in the 1st auxiliary task of size `[L_sub1]`
-                ys_sub2 (list): reference labels in the 2nd auxiliary task of size `[L_sub2]`
-                utt_ids (list): name of utterances
-                speakers (list): name of speakers
+                xs (List): input data of size `[T, input_dim]`
+                xlens (List): lengths of each element in xs
+                ys (List): reference labels in the main task of size `[L]`
+                ys_sub1 (List): reference labels in the 1st auxiliary task of size `[L_sub1]`
+                ys_sub2 (List): reference labels in the 2nd auxiliary task of size `[L_sub2]`
+                utt_ids (List): name of utterances
+                speakers (List): name of speakers
             task (str): all/ys*/ys_sub*
             is_eval (bool): evaluation mode
                 This should be used in inference model for memory efficiency.
@@ -284,7 +288,7 @@ class Speech2Text(ModelBase):
                                              teacher_logits, self.recog_params, self.idx2token,
                                              batch['trigger_points'])
             loss += loss_fwd
-            if isinstance(self.dec_fwd, RNNTransducer):
+            if isinstance(self.dec_fwd, RNNT):
                 observation['loss.transducer'] = obs_fwd['loss_transducer']
             else:
                 observation['acc.att'] = obs_fwd['acc_att']
@@ -322,7 +326,7 @@ class Speech2Text(ModelBase):
                     eout_dict['ys_' + sub]['xs'], eout_dict['ys_' + sub]['xlens'],
                     batch['ys_' + sub], task)
                 loss += loss_sub
-                if isinstance(getattr(self, 'dec_fwd_' + sub), RNNTransducer):
+                if isinstance(getattr(self, 'dec_fwd_' + sub), RNNT):
                     observation['loss.transducer-' + sub] = obs_fwd_sub['loss_transducer']
                 else:
                     observation['loss.att-' + sub] = obs_fwd_sub['loss_att']
@@ -358,7 +362,7 @@ class Speech2Text(ModelBase):
         """Encode acoustic or text features.
 
         Args:
-            xs (list): A list of length `[B]`, which contains Tensor of size `[T, input_dim]`
+            xs (List): length `[B]`, which contains Tensor of size `[T, input_dim]`
             task (str): all/ys*/ys_sub1*/ys_sub2*
             streaming (bool): streaming encoding
             lookback (bool): truncate leftmost frames for lookback in CNN context
@@ -403,7 +407,8 @@ class Speech2Text(ModelBase):
             # TODO(hirofumi): fix for Transformer
 
         # encoder
-        eout_dict = self.enc(xs, xlens, task.split('.')[0], streaming, lookback, lookahead)
+        eout_dict = self.enc(xs, xlens, task.split('.')[0], streaming,
+                             lookback, lookahead)
 
         if self.main_weight < 1 and self.enc_type in ['conv', 'tds', 'gated_conv']:
             for sub in ['sub1', 'sub2']:
@@ -437,7 +442,7 @@ class Speech2Text(ModelBase):
 
         Args:
             xs (FloatTensor): `[B, T, idim]`
-            ys (list): length `B`, each of which contains a list of size `[L]`
+            ys (List): length `B`, each of which contains a list of size `[L]`
         Returns:
             trigger_points (np.ndarray): `[B, L]`
 
@@ -470,9 +475,6 @@ class Speech2Text(ModelBase):
             self.dec_fwd_sub2._plot_ctc(mkdir_join(self.save_path, 'ctc_sub2'))
 
     def decode_streaming(self, xs, params, idx2token, exclude_eos=False, task='ys'):
-        from neural_sp.models.seq2seq.frontends.streaming import Streaming
-
-        # check configurations
         assert task == 'ys'
         assert self.input_type == 'speech'
         assert self.ctc_weight > 0
@@ -481,13 +483,16 @@ class Speech2Text(ModelBase):
         # assert params['recog_length_norm']
         global_params = copy.deepcopy(params)
         global_params['recog_max_len_ratio'] = 1.0
+        block_sync = params['recog_block_sync']
+        block_size = params['recog_block_sync_size']  # before subsampling
 
-        streaming = Streaming(xs[0], params, self.enc, idx2token)
-        chunk_sync = params['recog_chunk_sync']
+        streaming = Streaming(xs[0], params, self.enc, block_size)
+        factor = self.enc.subsampling_factor
+        block_size //= factor
 
         hyps = None
         best_hyp_id_stream = []
-        is_reset = True  # for the first chunk
+        is_reset = True  # for the first block
 
         stdout = False
 
@@ -497,80 +502,88 @@ class Speech2Text(ModelBase):
             lm_second = getattr(self, 'lm_second', None)
 
             while True:
-                # Encode input features chunk by chunk
-                x_chunk, is_last_chunk, lookback, lookahead = streaming.extract_feature()
+                # Encode input features block by block
+                x_block, is_last_block, cnn_lookback, cnn_lookahead = streaming.extract_feature()
                 if is_reset:
                     self.enc.reset_cache()
-                eout_chunk = self.encode([x_chunk], task,
-                                         streaming=True,
-                                         lookback=lookback,
-                                         lookahead=lookahead)[task]['xs']
-                is_reset = False  # detect the first boundary in the same chunk
+                eout_block_dict = self.encode([x_block], 'all', streaming=True,
+                                              lookback=cnn_lookback, lookahead=cnn_lookahead)
+                eout_block = eout_block_dict[task]['xs']
+                is_reset = False  # detect the first boundary in the same block
 
                 # CTC-based VAD
-                ctc_log_probs_chunk = None
                 if streaming.is_ctc_vad:
-                    ctc_probs_chunk = self.dec_fwd.ctc_probs(eout_chunk)
-                    if params['recog_ctc_weight'] > 0:
-                        ctc_log_probs_chunk = torch.log(ctc_probs_chunk)
-                    is_reset = streaming.ctc_vad(ctc_probs_chunk, stdout=stdout)
+                    if self.ctc_weight_sub1 > 0:
+                        ctc_probs_block = self.dec_fwd_sub1.ctc_probs(eout_block_dict['ys_sub1']['xs'])
+                        # TODO: consider subsampling
+                    else:
+                        ctc_probs_block = self.dec_fwd.ctc_probs(eout_block)
+                    is_reset = streaming.ctc_vad(ctc_probs_block, stdout=stdout)
 
                 # Truncate the most right frames
-                if is_reset and not is_last_chunk and streaming.bd_offset >= 0:
-                    eout_chunk = eout_chunk[:, :streaming.bd_offset]
-                streaming.eout_chunks.append(eout_chunk)
+                if is_reset and not is_last_block and streaming.bd_offset >= 0:
+                    eout_block = eout_block[:, :streaming.bd_offset]
+                streaming.cache_eout(eout_block)
 
-                # Chunk-synchronous attention decoding
-                if chunk_sync:
-                    end_hyps, hyps, aws_seg = self.dec_fwd.beam_search_chunk_sync(
-                        eout_chunk, params, idx2token, lm,
-                        ctc_log_probs=ctc_log_probs_chunk, hyps=hyps,
-                        state_carry_over=False,
-                        ignore_eos=self.enc.enc_type in ['lstm', 'conv_lstm'])
+                # Block-synchronous attention decoding
+                if isinstance(self.dec_fwd, RNNT):
+                    raise NotImplementedError
+                elif isinstance(self.dec_fwd, RNNDecoder) and block_sync:
+                    for i_block in range(math.ceil(eout_block.size(1) / block_size)):
+                        eout_block_i = eout_block[:, i_block * block_size:(i_block + 1) * block_size]
+                        end_hyps, hyps, _ = self.dec_fwd.beam_search_block_sync(
+                            eout_block_i, params, idx2token, hyps, lm,
+                            state_carry_over=False)
                     merged_hyps = sorted(end_hyps + hyps, key=lambda x: x['score'], reverse=True)
-                    best_hyp_id_prefix = np.array(merged_hyps[0]['hyp'][1:])
-                    if len(best_hyp_id_prefix) > 0 and best_hyp_id_prefix[-1] == self.eos:
-                        # reset beam if <eos> is generated from the best hypothesis
-                        best_hyp_id_prefix = best_hyp_id_prefix[:-1]  # exclude <eos>
-                        # Segmentation strategy 2:
-                        # If <eos> is emitted from the decoder (not CTC),
-                        # the current chunk is segmented.
-                        if not is_reset:
-                            streaming.bd_offset = eout_chunk.size(1) - 1
-                            is_reset = True
-                    if len(best_hyp_id_prefix) > 0:
-                        # print('\rStreaming (T:%d [frame], offset:%d [frame], blank:%d [frame]): %s' %
-                        #       (streaming.offset + eout_chunk.size(1) * streaming.factor,
-                        #        self.dec_fwd.n_frames * streaming.factor,
-                        #        streaming.n_blanks * streaming.factor,
-                        #        idx2token(best_hyp_id_prefix)))
-                        print('\r%s' % (idx2token(best_hyp_id_prefix)))
+                    if len(merged_hyps) > 0:
+                        best_hyp_id_prefix = np.array(merged_hyps[0]['hyp'][1:])
+                        if len(best_hyp_id_prefix) > 0 and best_hyp_id_prefix[-1] == self.eos:
+                            # reset beam if <eos> is generated from the best hypothesis
+                            best_hyp_id_prefix = best_hyp_id_prefix[:-1]  # exclude <eos>
+                            # Segmentation strategy 2:
+                            # If <eos> is emitted from the decoder (not CTC),
+                            # the current block is segmented.
+                            if not is_reset:
+                                streaming._bd_offset = eout_block.size(1) - 1
+                                # TODO: fix later
+                                is_reset = True
+                        if len(best_hyp_id_prefix) > 0:
+                            # print('\rStreaming (T:%d [frame], offset:%d [frame], blank:%d [frame]): %s' %
+                            #       (streaming.offset + eout_block.size(1) * factor,
+                            #        self.dec_fwd.n_frames * factor,
+                            #        streaming.n_blanks * factor,
+                            #        idx2token(best_hyp_id_prefix)))
+                            print('\r%s' % (idx2token(best_hyp_id_prefix)))
+                elif isinstance(self.dec_fwd, TransformerDecoder):
+                    best_hyp_id_prefix = []
+                    raise NotImplementedError
 
                 if is_reset:
                     # Global decoding over the segmented region
-                    if not chunk_sync:
-                        eout = torch.cat(streaming.eout_chunks, dim=1)
+                    if not block_sync:
+                        eout = streaming.pop_eouts()
                         elens = torch.IntTensor([eout.size(1)])
                         ctc_log_probs = None
                         if params['recog_ctc_weight'] > 0:
                             ctc_log_probs = torch.log(self.dec_fwd.ctc_probs(eout))
                         nbest_hyps_id_offline = self.dec_fwd.beam_search(
                             eout, elens, global_params, idx2token, lm, lm_second,
-                            ctc_log_probs=ctc_log_probs)[0]
-                        # print('Offline (T:%d [frame]): %s' %
-                        #       (streaming.offset + eout_chunk.size(1) * streaming.factor,
+                            ctc_log_probs=ctc_log_probs,
+                            exclude_eos=exclude_eos)[0]
+                        # print('Offline (T:%d [10ms]): %s' %
+                        #       (streaming.offset + eout_block.size(1) * factor,
                         #        idx2token(nbest_hyps_id_offline[0][0])))
 
                     # pick up the best hyp from ended and active hypotheses
-                    if not chunk_sync:
+                    if not block_sync:
                         if len(nbest_hyps_id_offline[0][0]) > 0:
                             best_hyp_id_stream.extend(nbest_hyps_id_offline[0][0])
                     else:
                         if len(best_hyp_id_prefix) > 0:
                             best_hyp_id_stream.extend(best_hyp_id_prefix)
-                        # print('Final (T:%d [frame], offset:%d [frame]): %s' %
-                        #       (streaming.offset + eout_chunk.size(1) * streaming.factor,
-                        #        self.dec_fwd.n_frames * streaming.factor,
+                        # print('Final (T:%d [10ms], offset:%d [10ms]): %s' %
+                        #       (streaming.offset + eout_block.size(1) * factor,
+                        #        self.dec_fwd.n_frames * factor,
                         #        idx2token(best_hyp_id_prefix)))
                         # print('-' * 50)
                         # for test
@@ -582,32 +595,32 @@ class Speech2Text(ModelBase):
                     streaming.reset(stdout=stdout)
                     hyps = None
 
-                streaming.next_chunk()
-                # next chunk will start from the frame next to the boundary
-                if not is_last_chunk:
-                    streaming.backoff(x_chunk, self.dec_fwd, stdout=stdout)
-                if is_last_chunk:
+                streaming.next_block()
+                if is_last_block:
                     break
+                # next block will start from the frame next to the boundary
+                streaming.backoff(x_block, self.dec_fwd, stdout=stdout)
 
-            # Global decoding for tail chunks
-            if not chunk_sync and len(streaming.eout_chunks) > 0:
-                eout = torch.cat(streaming.eout_chunks, dim=1)
+            # Global decoding for tail blocks
+            if not block_sync and streaming.n_cache_block > 0:
+                eout = streaming.pop_eouts()
                 elens = torch.IntTensor([eout.size(1)])
                 nbest_hyps_id_offline = self.dec_fwd.beam_search(
-                    eout, elens, global_params, idx2token, lm, lm_second)[0]
+                    eout, elens, global_params, idx2token, lm, lm_second,
+                    exclude_eos=exclude_eos)[0]
                 # print('MoChA: ' + idx2token(nbest_hyps_id_offline[0][0]))
                 # print('*' * 50)
                 if len(nbest_hyps_id_offline[0][0]) > 0:
                     best_hyp_id_stream.extend(nbest_hyps_id_offline[0][0])
 
             # pick up the best hyp
-            if not is_reset and chunk_sync and len(best_hyp_id_prefix) > 0:
+            if not is_reset and block_sync and len(best_hyp_id_prefix) > 0:
                 best_hyp_id_stream.extend(best_hyp_id_prefix)
 
             if len(best_hyp_id_stream) > 0:
-                return [np.stack(best_hyp_id_stream, axis=0)], [None]
+                return [[np.stack(best_hyp_id_stream, axis=0)]], [None]
             else:
-                return [[]], [None]
+                return [[[]]], [None]
 
     def streamable(self):
         return getattr(self.dec_fwd, 'streamable', False)
@@ -624,7 +637,7 @@ class Speech2Text(ModelBase):
         """Decode in the inference stage.
 
         Args:
-            xs (list): A list of length `[B]`, which contains arrays of size `[T, input_dim]`
+            xs (List): length `[B]`, which contains arrays of size `[T, input_dim]`
             params (dict): hyper-parameters for decoding
                 beam_width (int): the size of beam
                 min_len_ratio (float):
@@ -637,17 +650,17 @@ class Speech2Text(ModelBase):
                 fwd_bwd_attention (bool):
             idx2token (): converter from index to token
             exclude_eos (bool): exclude <eos> from best_hyps_id
-            refs_id (list): gold token IDs to compute log likelihood
-            refs (list): gold transcriptions
-            utt_ids (list):
-            speakers (list):
+            refs_id (List): gold token IDs to compute log likelihood
+            refs (List): gold transcriptions
+            utt_ids (List): utterance id list
+            speakers (List): speaker list
             task (str): ys* or ys_sub1* or ys_sub2*
-            ensemble_models (list): list of Speech2Text classes
+            ensemble_models (List): Speech2Text classes
             trigger_points (np.ndarray): `[B, L]`
             teacher_force (bool): conduct teacher-forcing
         Returns:
-            best_hyps_id (list): A list of length `[B]`, which contains arrays of size `[L]`
-            aws (list): A list of length `[B]`, which contains arrays of size `[L, T, n_heads]`
+            nbest_hyps_id (List[List[np.ndarray]]): length `[B]`, which contains a list of length `[n_best]` which contains arrays of size `[L]`
+            aws (List[np.ndarray]): length `[B]`, which contains arrays of size `[L, T, n_heads]`
 
         """
         if task.split('.')[0] == 'ys':
@@ -675,10 +688,11 @@ class Speech2Text(ModelBase):
                 lm_second = getattr(self, 'lm_second', None)
                 lm_second_bwd = None  # TODO
 
-                best_hyps_id = getattr(self, 'dec_' + dir).decode_ctc(
+                nbest_hyps_id = getattr(self, 'dec_' + dir).decode_ctc(
                     eout_dict[task]['xs'], eout_dict[task]['xlens'], params, idx2token,
-                    lm, lm_second, lm_second_bwd, 1, refs_id, utt_ids, speakers)
-                return best_hyps_id, None
+                    lm, lm_second, lm_second_bwd,
+                    params['recog_beam_width'], refs_id, utt_ids, speakers)
+                return nbest_hyps_id, None
 
             # Attention/RNN-T
             elif params['recog_beam_width'] == 1 and not params['recog_fwd_bwd_attention']:
@@ -686,6 +700,7 @@ class Speech2Text(ModelBase):
                     eout_dict[task]['xs'], eout_dict[task]['xlens'],
                     params['recog_max_len_ratio'], idx2token,
                     exclude_eos, refs_id, utt_ids, speakers)
+                nbest_hyps_id = [[hyp] for hyp in best_hyps_id]
             else:
                 assert params['recog_batch_size'] == 1
 
@@ -695,19 +710,19 @@ class Speech2Text(ModelBase):
 
                 # forward-backward decoding
                 if params['recog_fwd_bwd_attention']:
-                    lm_fwd = getattr(self, 'lm_fwd', None)
+                    lm = getattr(self, 'lm_fwd', None)
                     lm_bwd = getattr(self, 'lm_bwd', None)
 
                     # forward decoder
                     nbest_hyps_id_fwd, aws_fwd, scores_fwd = self.dec_fwd.beam_search(
                         eout_dict[task]['xs'], eout_dict[task]['xlens'],
-                        params, idx2token, lm_fwd, None, lm_bwd, ctc_log_probs,
+                        params, idx2token, lm, None, lm_bwd, ctc_log_probs,
                         params['recog_beam_width'], False, refs_id, utt_ids, speakers)
 
                     # backward decoder
                     nbest_hyps_id_bwd, aws_bwd, scores_bwd, _ = self.dec_bwd.beam_search(
                         eout_dict[task]['xs'], eout_dict[task]['xlens'],
-                        params, idx2token, lm_bwd, None, lm_fwd, ctc_log_probs,
+                        params, idx2token, lm_bwd, None, lm, ctc_log_probs,
                         params['recog_beam_width'], False, refs_id, utt_ids, speakers)
 
                     # forward-backward attention
@@ -716,6 +731,7 @@ class Speech2Text(ModelBase):
                         nbest_hyps_id_bwd, aws_bwd, scores_bwd,
                         self.eos, params['recog_gnmt_decoding'], params['recog_length_penalty'],
                         idx2token, refs_id)
+                    nbest_hyps_id = [[hyp] for hyp in best_hyps_id]
                     aws = None
                 else:
                     # ensemble
@@ -735,8 +751,7 @@ class Speech2Text(ModelBase):
                     nbest_hyps_id, aws, scores = getattr(self, 'dec_' + dir).beam_search(
                         eout_dict[task]['xs'], eout_dict[task]['xlens'],
                         params, idx2token, lm, lm_second, lm_bwd, ctc_log_probs,
-                        1, exclude_eos, refs_id, utt_ids, speakers,
+                        params['recog_beam_width'], exclude_eos, refs_id, utt_ids, speakers,
                         ensmbl_eouts, ensmbl_elens, ensmbl_decs)
-                    best_hyps_id = [hyp[0] for hyp in nbest_hyps_id]
 
-            return best_hyps_id, aws
+            return nbest_hyps_id, aws

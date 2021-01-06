@@ -10,10 +10,7 @@ import torch
 import shutil
 
 from neural_sp.models.base import ModelBase
-from neural_sp.models.torch_utils import (
-    np2tensor,
-    pad_list
-)
+from neural_sp.models.torch_utils import np2tensor
 
 import matplotlib
 matplotlib.use('Agg')
@@ -47,10 +44,11 @@ class DecoderBase(ModelBase):
 
     def _plot_attention(self, save_path=None, n_cols=2):
         """Plot attention for each head in all decoder layers."""
-        if getattr(self, 'att_weight', 0) == 0 and getattr(self, 'rnnt_weight', 0) == 0:
-            return
         if not hasattr(self, 'aws_dict'):
             return
+        if len(self.aws_dict.keys()) == 0:
+            return
+
         from matplotlib import pyplot as plt
         from matplotlib.ticker import MaxNLocator
 
@@ -58,9 +56,6 @@ class DecoderBase(ModelBase):
         if save_path is not None and os.path.isdir(save_path):
             shutil.rmtree(save_path)
             os.mkdir(save_path)
-
-        if len(self.aws_dict.keys()) == 0:
-            return
 
         elens = self.data_dict['elens']
         ylens = self.data_dict['ylens']
@@ -157,16 +152,17 @@ class DecoderBase(ModelBase):
         Returns:
             probs (FloatTensor): `[B, T, vocab]`
             topk_ids (LongTensor): `[B, T, topk]`
-            best_hyps (list): A list of length `[B]`, which contains arrays of size `[L]`
+            nbest_hyps (List[List[List]]): length `[B]`, which contains a list of length `[n_best]`,
+                which contains a list of length `[L]`
 
         """
         if params['recog_beam_width'] == 1:
-            best_hyps = self.ctc.greedy(eouts, elens)
+            nbest_hyps = self.ctc.greedy(eouts, elens)
         else:
-            best_hyps = self.ctc.beam_search(eouts, elens, params, idx2token,
-                                             lm, lm_second, lm_second_bwd,
-                                             nbest, refs_id, utt_ids, speakers)
-        return best_hyps
+            nbest_hyps = self.ctc.beam_search(eouts, elens, params, idx2token,
+                                              lm, lm_second, lm_second_bwd,
+                                              nbest, refs_id, utt_ids, speakers)
+        return nbest_hyps
 
     def ctc_probs(self, eouts, temperature=1.):
         """Return CTC probabilities.
@@ -177,7 +173,9 @@ class DecoderBase(ModelBase):
             probs (FloatTensor): `[B, T, vocab]`
 
         """
-        return torch.softmax(self.ctc.output(eouts) / temperature, dim=-1)
+        if self.ctc.output is not None:
+            eouts = self.ctc.output(eouts)
+        return torch.softmax(eouts / temperature, dim=-1)
 
     def ctc_log_probs(self, eouts, temperature=1.):
         """Return log-scale CTC probabilities.
@@ -188,7 +186,9 @@ class DecoderBase(ModelBase):
             log_probs (FloatTensor): `[B, T, vocab]`
 
         """
-        return torch.log_softmax(self.ctc.output(eouts) / temperature, dim=-1)
+        if self.ctc.output is not None:
+            eouts = self.ctc.output(eouts)
+        return torch.log_softmax(eouts / temperature, dim=-1)
 
     def ctc_probs_topk(self, eouts, temperature=1., topk=None):
         """Get CTC top-K probabilities.
@@ -213,8 +213,8 @@ class DecoderBase(ModelBase):
 
         Args:
             logits (FloatTensor): `[B, T, vocab]`
-            elens (list): length `B`
-            ys (list): length `B`, each of which contains a list of size `[L]`
+            elens (List): length `B`
+            ys (List): length `B`, each of which contains a list of size `[L]`
         Returns:
             trigger_points (IntTensor): `[B, L]`
 
@@ -223,23 +223,3 @@ class DecoderBase(ModelBase):
         ylens = np2tensor(np.fromiter([len(y) for y in ys], dtype=np.int32))
         trigger_points = self.ctc.forced_align(logits, elens, ys, ylens)
         return trigger_points
-
-    def lm_rescoring(self, hyps, lm, lm_weight, reverse=False, tag=''):
-        for i in range(len(hyps)):
-            ys = hyps[i]['hyp']  # include <sos>
-            if reverse:
-                ys = ys[::-1]
-
-            ys = [np2tensor(np.fromiter(ys, dtype=np.int64), self.device)]
-            ys_in = pad_list([y[:-1] for y in ys], -1)  # `[1, L-1]`
-            ys_out = pad_list([y[1:] for y in ys], -1)  # `[1, L-1]`
-
-            if ys_in.size(1) > 0:
-                _, _, scores_lm = lm.predict(ys_in, None)
-                score_lm = sum([scores_lm[0, t, ys_out[0, t]] for t in range(ys_out.size(1))])
-                score_lm /= ys_out.size(1)  # normalize by length
-            else:
-                score_lm = 0
-
-            hyps[i]['score'] += score_lm * lm_weight
-            hyps[i]['score_lm_' + tag] = score_lm

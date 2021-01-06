@@ -51,7 +51,7 @@ def main():
         if i == 0:
             # Load the ASR model
             model = Speech2Text(args, dir_name)
-            epoch = int(args.recog_model[0].split('-')[-1])
+            epoch = int(float(args.recog_model[0].split('-')[-1]) * 10) / 10
             if args.recog_n_average > 1:
                 # Model averaging for Transformer
                 model = average_checkpoints(model, args.recog_model[0],
@@ -129,19 +129,24 @@ def main():
 
         while True:
             batch, is_new_epoch = dataloader.next(recog_params['recog_batch_size'])
-            best_hyps_id, aws = model.decode(
+            nbest_hyps_id, aws = model.decode(
                 batch['xs'], recog_params, dataloader.idx2token[0],
                 exclude_eos=False,
                 refs_id=batch['ys'],
                 ensemble_models=ensemble_models[1:] if len(ensemble_models) > 1 else [],
                 speakers=batch['sessions'] if dataloader.corpus == 'swbd' else batch['speakers'])
+            best_hyps_id = [h[0] for h in nbest_hyps_id]
 
             # Get CTC probs
             ctc_probs, topk_ids = None, None
             if args.ctc_weight > 0:
                 ctc_probs, topk_ids, xlens = model.get_ctc_probs(
-                    batch['xs'], temperature=1, topk=min(100, model.vocab))
+                    batch['xs'], task='ys', temperature=1, topk=min(100, model.vocab))
                 # NOTE: ctc_probs: '[B, T, topk]'
+            ctc_probs_sub1, topk_ids_sub1 = None, None
+            if args.ctc_weight_sub1 > 0:
+                ctc_probs_sub1, topk_ids_sub1, xlens_sub1 = model.get_ctc_probs(
+                    batch['xs'], task='ys_sub1', temperature=1, topk=min(100, model.vocab_sub1))
 
             if model.bwd_weight > 0.5:
                 # Reverse the order
@@ -160,7 +165,9 @@ def main():
                     save_path=mkdir_join(save_path, spk, batch['utt_ids'][b] + '.png'),
                     figsize=(20, 8),
                     ctc_probs=ctc_probs[b, :xlens[b]] if ctc_probs is not None else None,
-                    ctc_topk_ids=topk_ids[b] if topk_ids is not None else None)
+                    ctc_topk_ids=topk_ids[b] if topk_ids is not None else None,
+                    ctc_probs_sub1=ctc_probs_sub1[b, :xlens_sub1[b]] if ctc_probs_sub1 is not None else None,
+                    ctc_topk_ids_sub1=topk_ids_sub1[b] if topk_ids_sub1 is not None else None)
 
                 if model.bwd_weight > 0.5:
                     hyp = ' '.join(tokens[::-1])

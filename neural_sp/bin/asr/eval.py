@@ -60,7 +60,7 @@ def main():
         if i == 0:
             # Load the ASR model
             model = Speech2Text(args, dir_name)
-            epoch = int(args.recog_model[0].split('-')[-1])
+            epoch = int(float(args.recog_model[0].split('-')[-1]) * 10) / 10
             if args.recog_n_average > 1:
                 # Model averaging for Transformer
                 # topk_list = load_checkpoint(args.recog_model[0], model)
@@ -167,7 +167,9 @@ def main():
                 wer, cer, _ = eval_word(ensemble_models, dataloader, recog_params,
                                         epoch=epoch - 1,
                                         recog_dir=args.recog_dir,
-                                        progressbar=True)
+                                        progressbar=True,
+                                        fine_grained=True,
+                                        oracle=True)
                 wer_avg += wer
                 cer_avg += cer
             elif args.recog_unit == 'wp':
@@ -177,7 +179,7 @@ def main():
                                           streaming=args.recog_streaming,
                                           progressbar=True,
                                           fine_grained=True,
-                                          teacher_force=len(args.recog_word_alignments) > 0)
+                                          oracle=True)
                 wer_avg += wer
                 cer_avg += cer
             elif 'char' in args.recog_unit:
@@ -185,7 +187,9 @@ def main():
                                      epoch=epoch - 1,
                                      recog_dir=args.recog_dir,
                                      progressbar=True,
-                                     task_idx=0)
+                                     task_idx=0,
+                                     fine_grained=True,
+                                     oracle=True)
                 #  task_idx=1 if args.recog_unit and 'char' in args.recog_unit else 0)
                 wer_avg += wer
                 cer_avg += cer
@@ -193,7 +197,9 @@ def main():
                 per = eval_phone(ensemble_models, dataloader, recog_params,
                                  epoch=epoch - 1,
                                  recog_dir=args.recog_dir,
-                                 progressbar=True)
+                                 progressbar=True,
+                                 fine_grained=True,
+                                 oracle=True)
                 per_avg += per
             else:
                 raise ValueError(args.recog_unit)
@@ -209,7 +215,8 @@ def main():
                                        recog_dir=args.recog_dir,
                                        streaming=args.recog_streaming,
                                        progressbar=True,
-                                       fine_grained=True)
+                                       fine_grained=True,
+                                       oracle=True)
             bleu_avg += bleu
         else:
             raise NotImplementedError(args.recog_metric)

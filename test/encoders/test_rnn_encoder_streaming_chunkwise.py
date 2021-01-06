@@ -9,8 +9,10 @@ import numpy as np
 import pytest
 import torch
 
-from neural_sp.models.torch_utils import np2tensor
-from neural_sp.models.torch_utils import pad_list
+from neural_sp.models.torch_utils import (
+    np2tensor,
+    pad_list
+)
 
 
 def make_args(**kwargs):
@@ -40,8 +42,8 @@ def make_args(**kwargs):
         bidir_sum_fwd_bwd=False,
         task_specific_layer=False,
         param_init=0.1,
-        chunk_size_left="0",
         chunk_size_right="0",
+        rsp_prob=0,
     )
     args.update(kwargs)
     return args
@@ -51,50 +53,52 @@ def make_args(**kwargs):
     "args",
     [
         # no CNN
-        ({'enc_type': 'blstm', 'chunk_size_left': "20", 'chunk_size_right': "20"}),
-        ({'enc_type': 'blstm', 'chunk_size_left': "32", 'chunk_size_right': "16"}),
-        ({'enc_type': 'lstm', 'chunk_size_left': "1"}),
+        ({'enc_type': 'blstm', 'chunk_size_current': "20", 'chunk_size_right': "20"}),
+        ({'enc_type': 'blstm', 'chunk_size_current': "32", 'chunk_size_right': "16"}),
+        ({'enc_type': 'lstm', 'chunk_size_current': "1"}),  # unidirectional
+        ({'enc_type': 'lstm', 'chunk_size_current': "40"}),  # unidirectional
         # no CNN, frame stacking
         ({'enc_type': 'blstm', 'n_stacks': 2,
-          'chunk_size_left': "20", 'chunk_size_right': "20"}),
+          'chunk_size_current': "20", 'chunk_size_right': "20"}),
         ({'enc_type': 'blstm', 'n_stacks': 2,
-          'chunk_size_left': "32", 'chunk_size_right': "16"}),
-        ({'enc_type': 'lstm', 'n_stacks': 2, 'chunk_size_left': "2"}),
-        ({'enc_type': 'lstm', 'n_stacks': 3, 'chunk_size_left': "3"}),
+          'chunk_size_current': "32", 'chunk_size_right': "16"}),
+        ({'enc_type': 'lstm', 'n_stacks': 2, 'chunk_size_current': "2"}),
+        ({'enc_type': 'lstm', 'n_stacks': 3, 'chunk_size_current': "3"}),
         # subsample: 1/2
         ({'enc_type': 'conv',
           'conv_channels': "32", 'conv_kernel_sizes': "(3,3)",
           'conv_strides': "(1,1)", 'conv_poolings': "(2,2)",
-          'chunk_size_left': "4"}),
+          'chunk_size_current': "4"}),
         ({'enc_type': 'conv',
           'conv_channels': "32", 'conv_kernel_sizes': "(3,3)",
           'conv_strides': "(1,1)", 'conv_poolings': "(2,2)",
-          'chunk_size_left': "32"}),
+          'chunk_size_current': "32"}),
         # subsample: 1/4
-        ({'enc_type': 'conv', 'chunk_size_left': "8"}),
-        ({'enc_type': 'conv', 'chunk_size_left': "32"}),
+        ({'enc_type': 'conv', 'chunk_size_current': "8"}),
+        ({'enc_type': 'conv', 'chunk_size_current': "32"}),
+        ({'enc_type': 'conv_lstm', 'chunk_size_current': "8"}),  # unidirectional
+        ({'enc_type': 'conv_lstm', 'chunk_size_current': "40"}),  # unidirectional
         ({'enc_type': 'conv_blstm',
-          'chunk_size_left': "20", 'chunk_size_right': "20"}),
+          'chunk_size_current': "20", 'chunk_size_right': "20"}),
         ({'enc_type': 'conv_blstm',
-          'chunk_size_left': "32", 'chunk_size_right': "16"}),
-        # ({'enc_type': 'conv_lstm', 'chunk_size_left': "8"}),  # problem at the last frame
+          'chunk_size_current': "32", 'chunk_size_right': "16"}),
         # subsample: 1/8
         ({'enc_type': 'conv',
           'conv_channels': "32_32_32", 'conv_kernel_sizes': "(3,3)_(3,3)_(3,3)",
           'conv_strides': "(1,1)_(1,1)_(1,1)", 'conv_poolings': "(2,2)_(2,2)_(2,2)",
-          'chunk_size_left': "16"}),
+          'chunk_size_current': "16"}),
         ({'enc_type': 'conv',
           'conv_channels': "32_32_32", 'conv_kernel_sizes': "(3,3)_(3,3)_(3,3)",
           'conv_strides': "(1,1)_(1,1)_(1,1)", 'conv_poolings': "(2,2)_(2,2)_(2,2)",
-          'chunk_size_left': "32"}),
+          'chunk_size_current': "32"}),
         ({'enc_type': 'conv_blstm',
           'conv_channels': "32_32_32", 'conv_kernel_sizes': "(3,3)_(3,3)_(3,3)",
           'conv_strides': "(1,1)_(1,1)_(1,1)", 'conv_poolings': "(2,2)_(2,2)_(2,2)",
-          'chunk_size_left': "32", 'chunk_size_right': "16"}),
+          'chunk_size_current': "32", 'chunk_size_right': "16"}),
         ({'enc_type': 'conv_blstm',
           'conv_channels': "32_32_32", 'conv_kernel_sizes': "(3,3)_(3,3)_(3,3)",
           'conv_strides': "(1,1)_(1,1)_(1,1)", 'conv_poolings': "(2,2)_(2,2)_(2,2)",
-          'chunk_size_left': "64", 'chunk_size_right': "32"}),
+          'chunk_size_current': "64", 'chunk_size_right': "32"}),
     ]
 )
 def test_forward_streaming_chunkwise(args):
@@ -104,21 +108,21 @@ def test_forward_streaming_chunkwise(args):
     batch_size = 1
     xmaxs = [t for t in range(160, 192, 1)]
     device = "cpu"
+    atol = 1e-05
 
-    N_l = max(0, int(args['chunk_size_left'].split('_')[0])) // args['n_stacks']
+    N_c = max(0, int(args['chunk_size_current'].split('_')[0])) // args['n_stacks']
     N_r = max(0, int(args['chunk_size_right'].split('_')[0])) // args['n_stacks']
     if unidir:
-        args['chunk_size_left'] = "0"
+        args['chunk_size_current'] = "0"
         args['chunk_size_right'] = "0"
     module = importlib.import_module('neural_sp.models.seq2seq.encoders.rnn')
     enc = module.RNNEncoder(**args)
     enc = enc.to(device)
     if enc.lc_bidir:
-        assert N_l > 0
+        assert N_c > 0
 
     factor = enc.subsampling_factor
-    conv_lookback = enc.conv.n_frames_context if enc.conv is not None else 0
-    conv_lookahead = enc.conv.n_frames_context if enc.conv is not None else 0
+    conv_lookahead = enc.conv.context_size if enc.conv is not None else 0
 
     module_fs = importlib.import_module('neural_sp.models.seq2seq.frontends.frame_stacking')
 
@@ -132,6 +136,11 @@ def test_forward_streaming_chunkwise(args):
 
             if args['n_stacks'] > 1:
                 xs = [module_fs.stack_frame(x, args['n_stacks'], args['n_stacks']) for x in xs]
+            else:
+                # zero padding for the last chunk
+                if xmax % N_c != 0:
+                    zero_pad = np.zeros((batch_size, N_c - xmax % N_c, args['input_dim'])).astype(np.float32)
+                    xs = np.concatenate([xs, zero_pad], axis=1)
 
             xlens = torch.IntTensor([len(x) for x in xs])
             xmax = xlens.max().item()
@@ -148,12 +157,12 @@ def test_forward_streaming_chunkwise(args):
             # chunk by chunk encoding
             eouts_stream = []
             elens_stream = 0
-            n_chunks = math.ceil(xmax / N_l)
+            n_chunks = math.ceil(xmax / N_c)
             j = 0  # time offset for input
             j_out = 0  # time offset for encoder output
             for chunk_idx in range(n_chunks):
-                start = j - conv_lookback
-                end = (j + N_l + N_r) + conv_lookahead
+                start = j - conv_lookahead
+                end = (j + N_c + N_r) + conv_lookahead
                 xs_pad_stream = pad_list(
                     [np2tensor(x[max(0, start):end], device).float() for x in xs], 0.)
                 xlens_stream = torch.IntTensor([xs_pad_stream.size(1) for x in xs])
@@ -162,7 +171,7 @@ def test_forward_streaming_chunkwise(args):
                                           lookback=start >= 0,
                                           lookahead=end <= xmax - 1)
 
-                eout_all_i = enc_out_dict['ys']['xs'][:, j_out:j_out + (N_l // factor)]
+                eout_all_i = enc_out_dict['ys']['xs'][:, j_out:j_out + (N_c // factor)]
                 if eout_all_i.size(1) == 0:
                     break
                 eout_stream_i = enc_out_dict_stream['ys']['xs']
@@ -171,13 +180,13 @@ def test_forward_streaming_chunkwise(args):
                 eout_stream_i = eout_stream_i[:, :eout_all_i.size(1)]
                 elens_stream_i -= diff
                 for t in range(eout_stream_i.size(1)):
-                    print(torch.equal(eout_all_i[:, t], eout_stream_i[:, t]))
+                    print(torch.allclose(eout_all_i[:, t], eout_stream_i[:, t], atol=atol))
 
                 eouts_stream.append(eout_stream_i)
                 elens_stream += elens_stream_i
 
-                j += N_l
-                j_out += (N_l // factor)
+                j += N_c
+                j_out += (N_c // factor)
                 if j > xmax:
                     break
 
@@ -185,6 +194,6 @@ def test_forward_streaming_chunkwise(args):
 
             eouts_stream = torch.cat(eouts_stream, dim=1)
             assert enc_out_dict['ys']['xs'].size() == eouts_stream.size()
-            assert torch.equal(enc_out_dict['ys']['xs'], eouts_stream)
+            assert torch.allclose(enc_out_dict['ys']['xs'], eouts_stream, atol=atol)
             assert elens_stream.item() == eouts_stream.size(1)
             assert torch.equal(enc_out_dict['ys']['xlens'], elens_stream)

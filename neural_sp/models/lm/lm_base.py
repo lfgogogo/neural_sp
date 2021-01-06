@@ -102,7 +102,7 @@ class LMBase(ModelBase):
                                               self.lsm_prob, self.pad, self.training,
                                               normalize_length=True)
             else:
-                loss = self.adaptive_softmax(logits.view((-1, logits.size(2))),
+                loss = self.adaptive_softmax(logits.reshape((-1, logits.size(2))),
                                              ys_out.contiguous().view(-1)).loss
                 ppl = np.exp(loss.item())
 
@@ -116,7 +116,7 @@ class LMBase(ModelBase):
             acc = compute_accuracy(logits, ys_out, pad=self.pad)
         else:
             acc = compute_accuracy(self.adaptive_softmax.log_prob(
-                logits.view((-1, logits.size(2)))), ys_out, pad=self.pad)
+                logits.reshape((-1, logits.size(2)))), ys_out, pad=self.pad)
 
         observation = {'loss.lm': loss.item(), 'acc.lm': acc, 'ppl.lm': ppl}
         return loss, new_state, observation
@@ -131,7 +131,7 @@ class LMBase(ModelBase):
     def decode(self, ys, state=None, mems=None, incremental=False):
         raise NotImplementedError
 
-    def predict(self, ys, state=None, mems=None, cache=None):
+    def predict(self, ys, state=None, mems=None, cache=None, emb_cache=False):
         """Precict function for ASR.
 
         Args:
@@ -144,6 +144,7 @@ class LMBase(ModelBase):
                 - TransformerXL (list): length `n_layers + 1`, each of which contains a tensor`[B, L, d_model]`
             mems (list):
             cache (list):
+            emb_cache (bool): precompute token embeddings for fast infernece
         Returns:
             lmout (FloatTensor): `[B, L, vocab]`, used for LM integration such as cold fusion
             state:
@@ -156,7 +157,7 @@ class LMBase(ModelBase):
 
         """
         logits, lmout, new_state = self.decode(ys, state, mems=mems, cache=cache,
-                                               incremental=True)
+                                               incremental=True, emb_cache=emb_cache)
         log_probs = torch.log_softmax(logits, dim=-1)
         return lmout, new_state, log_probs
 
